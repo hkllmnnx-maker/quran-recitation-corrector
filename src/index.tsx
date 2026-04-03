@@ -2,234 +2,368 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 
 const app = new Hono()
-
 app.use('/api/*', cors())
 
 // ============= API Routes =============
 
-// Get list of all surahs
 app.get('/api/surahs', async (c) => {
   try {
     const res = await fetch('https://api.alquran.cloud/v1/surah')
     const data = await res.json() as any
     if (data.code === 200) {
       const surahs = data.data.map((s: any) => ({
-        number: s.number,
-        name: s.name,
-        englishName: s.englishName,
+        number: s.number, name: s.name, englishName: s.englishName,
         englishNameTranslation: s.englishNameTranslation,
-        numberOfAyahs: s.numberOfAyahs,
-        revelationType: s.revelationType
+        numberOfAyahs: s.numberOfAyahs, revelationType: s.revelationType
       }))
       return c.json({ success: true, surahs })
     }
-    return c.json({ success: false, error: 'Failed to fetch surahs' }, 500)
-  } catch (err) {
-    return c.json({ success: false, error: 'API error' }, 500)
-  }
+    return c.json({ success: false, error: 'Failed' }, 500)
+  } catch { return c.json({ success: false, error: 'API error' }, 500) }
 })
 
-// Get a specific surah with Arabic text (Uthmani script)
-app.get('/api/surah/:number', async (c) => {
-  const num = c.req.param('number')
-  try {
-    const res = await fetch(`https://api.alquran.cloud/v1/surah/${num}/quran-uthmani`)
-    const data = await res.json() as any
-    if (data.code === 200) {
-      const surah = {
-        number: data.data.number,
-        name: data.data.name,
-        englishName: data.data.englishName,
-        numberOfAyahs: data.data.numberOfAyahs,
-        ayahs: data.data.ayahs.map((a: any) => ({
-          number: a.numberInSurah,
-          text: a.text,
-          globalNumber: a.number
-        }))
-      }
-      return c.json({ success: true, surah })
-    }
-    return c.json({ success: false, error: 'Surah not found' }, 500)
-  } catch (err) {
-    return c.json({ success: false, error: 'API error' }, 500)
-  }
-})
-
-// Get specific ayahs range
+// Fetch BOTH uthmani + simple text for accurate comparison
 app.get('/api/surah/:number/ayahs/:from/:to', async (c) => {
   const num = c.req.param('number')
   const from = parseInt(c.req.param('from'))
   const to = parseInt(c.req.param('to'))
   try {
-    const res = await fetch(`https://api.alquran.cloud/v1/surah/${num}/quran-uthmani`)
-    const data = await res.json() as any
-    if (data.code === 200) {
-      const ayahs = data.data.ayahs
+    const [uthmaniRes, simpleRes] = await Promise.all([
+      fetch(`https://api.alquran.cloud/v1/surah/${num}/quran-uthmani`),
+      fetch(`https://api.alquran.cloud/v1/surah/${num}/ar.asad`).catch(() => null)
+    ])
+    const uthmaniData = await uthmaniRes.json() as any
+    let simpleData: any = null
+    // Also fetch simple/clean text for comparison
+    const simpleRes2 = await fetch(`https://api.alquran.cloud/v1/surah/${num}`)
+    simpleData = await simpleRes2.json() as any
+
+    if (uthmaniData.code === 200) {
+      const ayahs = uthmaniData.data.ayahs
         .filter((a: any) => a.numberInSurah >= from && a.numberInSurah <= to)
-        .map((a: any) => ({
-          number: a.numberInSurah,
-          text: a.text,
-          globalNumber: a.number
-        }))
+        .map((a: any) => {
+          const simpleAyah = simpleData?.data?.ayahs?.find((sa: any) => sa.numberInSurah === a.numberInSurah)
+          return {
+            number: a.numberInSurah,
+            text: a.text, // Uthmani for display
+            simpleText: simpleAyah?.text || a.text, // Simple for comparison
+            globalNumber: a.number
+          }
+        })
       return c.json({
         success: true,
-        surahName: data.data.name,
-        surahNumber: data.data.number,
+        surahName: uthmaniData.data.name,
+        surahNumber: uthmaniData.data.number,
         ayahs
       })
     }
     return c.json({ success: false, error: 'Not found' }, 500)
-  } catch (err) {
-    return c.json({ success: false, error: 'API error' }, 500)
-  }
+  } catch { return c.json({ success: false, error: 'API error' }, 500) }
 })
 
-// Text comparison and analysis endpoint
+// ============= Advanced Analysis Endpoint =============
 app.post('/api/analyze', async (c) => {
   try {
     const body = await c.req.json() as any
     const { recitedText, originalAyahs } = body
-
     if (!recitedText || !originalAyahs || !Array.isArray(originalAyahs)) {
-      return c.json({ success: false, error: 'Missing required fields' }, 400)
+      return c.json({ success: false, error: 'Missing fields' }, 400)
     }
-
-    const analysis = analyzeRecitation(recitedText, originalAyahs)
+    const analysis = analyzeRecitationAdvanced(recitedText, originalAyahs)
     return c.json({ success: true, analysis })
-  } catch (err) {
-    return c.json({ success: false, error: 'Analysis error' }, 500)
-  }
+  } catch { return c.json({ success: false, error: 'Analysis error' }, 500) }
 })
 
-// ============= Text Analysis Functions =============
-
-function normalizeArabic(text: string): string {
-  return text
-    // Remove tashkeel (diacritics)
-    .replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]/g, '')
-    // Normalize alef variants
-    .replace(/[\u0622\u0623\u0625\u0671]/g, '\u0627')
-    // Normalize taa marbuta to haa
-    .replace(/\u0629/g, '\u0647')
-    // Normalize alef maqsura to yaa
-    .replace(/\u0649/g, '\u064A')
-    // Remove tatweel
-    .replace(/\u0640/g, '')
-    // Remove extra spaces
-    .replace(/\s+/g, ' ')
-    .trim()
+// ============= ADVANCED Arabic Normalization =============
+function deepNormalizeArabic(text: string): string {
+  let t = text
+  // Remove BOM and zero-width chars
+  t = t.replace(/[\uFEFF\u200B\u200C\u200D\u200E\u200F\u00A0]/g, '')
+  // Remove ALL Arabic diacritics/tashkeel  
+  t = t.replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED\u08D3-\u08E1\u08E3-\u08FF\uFE70-\uFE7F]/g, '')
+  // Normalize hamza-alef variants → bare alef
+  t = t.replace(/[\u0622\u0623\u0625\u0671\u0672\u0673\u0675]/g, '\u0627')
+  // Normalize hamza variants
+  t = t.replace(/[\u0624]/g, '\u0648') // hamza on waw → waw
+  t = t.replace(/[\u0626]/g, '\u064A') // hamza on ya → ya
+  t = t.replace(/[\u0621]/g, '') // standalone hamza → remove
+  // Normalize taa marbuta → haa
+  t = t.replace(/\u0629/g, '\u0647')
+  // Normalize alef maqsura → yaa
+  t = t.replace(/\u0649/g, '\u064A')
+  // Remove tatweel (kashida)
+  t = t.replace(/\u0640/g, '')
+  // Normalize lam-alef ligatures
+  t = t.replace(/[\uFEF5\uFEF6\uFEF7\uFEF8\uFEF9\uFEFA\uFEFB\uFEFC]/g, '\u0644\u0627')
+  // Remove Quranic stop marks and sajda marks
+  t = t.replace(/[\u06D6-\u06ED]/g, '')
+  // Remove decorative/presentation forms (if any)
+  t = t.replace(/[\uFB50-\uFDFF\uFE00-\uFE0F]/g, (match) => {
+    // Keep the char but in standard form - for safety just keep it
+    return match
+  })
+  // Collapse spaces
+  t = t.replace(/\s+/g, ' ')
+  return t.trim()
 }
 
-function levenshteinDistance(s1: string, s2: string): number {
-  const m = s1.length
-  const n = s2.length
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
+// Even deeper normalization for fuzzy matching
+function ultraNormalize(word: string): string {
+  let w = deepNormalizeArabic(word)
+  // Remove alef at start (definite article residue "ال")
+  // Don't remove - it changes meaning
+  // Remove trailing haa that might be taa marbuta
+  // Already handled
+  // Normalize final noon + alef → noon
+  // Keep as is
+  return w
+}
 
-  for (let i = 0; i <= m; i++) dp[i][0] = i
-  for (let j = 0; j <= n; j++) dp[0][j] = j
-
+// ============= Fuzzy Word Matching =============
+function charDistance(a: string, b: string): number {
+  const m = a.length, n = b.length
+  if (m === 0) return n
+  if (n === 0) return m
+  const dp: number[][] = []
+  for (let i = 0; i <= m; i++) { dp[i] = [i] }
+  for (let j = 1; j <= n; j++) { dp[0][j] = j }
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
-      if (s1[i - 1] === s2[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1]
-      } else {
-        dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
-      }
+      if (a[i-1] === b[j-1]) dp[i][j] = dp[i-1][j-1]
+      else dp[i][j] = 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
     }
   }
   return dp[m][n]
 }
 
-function getWordDiff(original: string[], recited: string[]): any[] {
-  const m = original.length
-  const n = recited.length
+function wordSimilarity(w1: string, w2: string): number {
+  if (w1 === w2) return 1.0
+  const maxLen = Math.max(w1.length, w2.length)
+  if (maxLen === 0) return 1.0
+  const dist = charDistance(w1, w2)
+  return (maxLen - dist) / maxLen
+}
+
+// Check if two words are "the same" with configurable threshold
+function wordsMatch(original: string, recited: string, threshold: number = 0.78): boolean {
+  const o = ultraNormalize(original)
+  const r = ultraNormalize(recited)
+  if (o === r) return true
+  // Check without alef-lam prefix
+  const oNoAl = o.replace(/^ال/, '')
+  const rNoAl = r.replace(/^ال/, '')
+  if (oNoAl === rNoAl && oNoAl.length > 1) return true
+  if (o === rNoAl || oNoAl === r) return true
+  // Fuzzy match
+  return wordSimilarity(o, r) >= threshold
+}
+
+// ============= Advanced Word-Level Diff (Weighted) =============
+function advancedWordDiff(original: string[], recited: string[]): any[] {
+  const m = original.length, n = recited.length
+  
+  // Cost matrix with fuzzy matching
+  const MATCH = 0, SUB = 1, INS = 1, DEL = 1
+  const FUZZY_MATCH = 0.3 // partial credit for fuzzy match
+  
   const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
-
-  for (let i = 0; i <= m; i++) dp[i][0] = i
-  for (let j = 0; j <= n; j++) dp[0][j] = j
-
+  const op: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0)) // operation type
+  
+  for (let i = 0; i <= m; i++) dp[i][0] = i * DEL
+  for (let j = 0; j <= n; j++) dp[0][j] = j * INS
+  
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
-      if (original[i - 1] === recited[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1]
+      const oWord = ultraNormalize(original[i-1])
+      const rWord = ultraNormalize(recited[j-1])
+      
+      let matchCost: number
+      if (oWord === rWord) {
+        matchCost = MATCH
+      } else if (wordsMatch(original[i-1], recited[j-1], 0.78)) {
+        matchCost = FUZZY_MATCH // almost match
       } else {
-        dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+        matchCost = SUB
       }
+      
+      const costs = [
+        dp[i-1][j-1] + matchCost,  // match/substitute
+        dp[i-1][j] + DEL,           // deletion
+        dp[i][j-1] + INS            // insertion
+      ]
+      
+      dp[i][j] = Math.min(...costs)
+      op[i][j] = costs.indexOf(dp[i][j]) // 0=diag, 1=up, 2=left
     }
   }
-
-  // Backtrack to find operations
-  const operations: any[] = []
+  
+  // Backtrack
+  const result: any[] = []
   let i = m, j = n
   while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && original[i - 1] === recited[j - 1]) {
-      operations.unshift({ type: 'correct', original: original[i - 1], recited: recited[j - 1] })
+    if (i > 0 && j > 0 && op[i][j] === 0) {
+      const oWord = ultraNormalize(original[i-1])
+      const rWord = ultraNormalize(recited[j-1])
+      const sim = wordSimilarity(oWord, rWord)
+      
+      if (oWord === rWord || sim >= 0.78) {
+        result.unshift({
+          type: 'correct',
+          original: original[i-1],
+          recited: recited[j-1],
+          similarity: Math.round(sim * 100),
+          fuzzy: oWord !== rWord
+        })
+      } else {
+        result.unshift({
+          type: 'substitution',
+          original: original[i-1],
+          recited: recited[j-1],
+          similarity: Math.round(sim * 100)
+        })
+      }
       i--; j--
-    } else if (i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + 1) {
-      operations.unshift({ type: 'substitution', original: original[i - 1], recited: recited[j - 1] })
-      i--; j--
-    } else if (j > 0 && dp[i][j] === dp[i][j - 1] + 1) {
-      operations.unshift({ type: 'insertion', original: null, recited: recited[j - 1] })
-      j--
-    } else {
-      operations.unshift({ type: 'deletion', original: original[i - 1], recited: null })
+    } else if (i > 0 && (j === 0 || op[i][j] === 1)) {
+      result.unshift({ type: 'deletion', original: original[i-1], recited: null })
       i--
+    } else {
+      result.unshift({ type: 'insertion', original: null, recited: recited[j-1] })
+      j--
     }
   }
-  return operations
+  return result
 }
 
-interface AyahData {
-  number: number
-  text: string
+// ============= Smart Per-Ayah Alignment =============
+function alignRecitedToAyahs(recitedWords: string[], ayahs: { number: number, text: string, simpleText?: string }[]) {
+  const results: any[] = []
+  let recIdx = 0
+
+  for (const ayah of ayahs) {
+    const ayahText = ayah.simpleText || ayah.text
+    const ayahNormWords = deepNormalizeArabic(ayahText).split(' ').filter(w => w.length > 0)
+    const ayahWordCount = ayahNormWords.length
+    
+    // Try different window sizes to find best match
+    let bestScore = -1
+    let bestEnd = recIdx + ayahWordCount
+    
+    // Search range: from exact length to +/- 40% 
+    const minLen = Math.max(1, Math.floor(ayahWordCount * 0.6))
+    const maxLen = Math.min(recitedWords.length - recIdx, Math.ceil(ayahWordCount * 1.4))
+    
+    for (let tryLen = minLen; tryLen <= maxLen; tryLen++) {
+      const tryWords = recitedWords.slice(recIdx, recIdx + tryLen)
+      const score = computeAlignmentScore(ayahNormWords, tryWords)
+      if (score > bestScore) {
+        bestScore = score
+        bestEnd = recIdx + tryLen
+      }
+    }
+    
+    // If no good match found, use expected length
+    if (bestScore < 0.2) {
+      bestEnd = Math.min(recIdx + ayahWordCount, recitedWords.length)
+    }
+    
+    const matchedWords = recitedWords.slice(recIdx, bestEnd)
+    const diff = advancedWordDiff(ayahNormWords, matchedWords)
+    const correct = diff.filter(d => d.type === 'correct').length
+    const total = ayahNormWords.length
+    const similarity = total > 0 ? Math.round((correct / total) * 100) : 0
+    
+    results.push({
+      ayahNumber: ayah.number,
+      originalText: ayah.text,
+      simpleText: ayah.simpleText || ayah.text,
+      similarity,
+      wordCount: total,
+      correctCount: correct,
+      diff,
+      status: similarity >= 85 ? 'correct' : similarity >= 55 ? 'partial' : 'error'
+    })
+    
+    recIdx = bestEnd
+  }
+  
+  return results
 }
 
-function analyzeRecitation(recitedText: string, originalAyahs: AyahData[]) {
-  const fullOriginal = originalAyahs.map(a => a.text).join(' ')
-  const normalizedRecited = normalizeArabic(recitedText)
-  const normalizedOriginal = normalizeArabic(fullOriginal)
+function computeAlignmentScore(original: string[], recited: string[]): number {
+  if (recited.length === 0) return 0
+  let matches = 0
+  const usedJ = new Set<number>()
+  
+  for (const oWord of original) {
+    const oNorm = ultraNormalize(oWord)
+    let bestJ = -1, bestSim = 0
+    
+    for (let j = 0; j < recited.length; j++) {
+      if (usedJ.has(j)) continue
+      const rNorm = ultraNormalize(recited[j])
+      const sim = wordSimilarity(oNorm, rNorm)
+      if (sim > bestSim) { bestSim = sim; bestJ = j }
+    }
+    
+    if (bestSim >= 0.75 && bestJ >= 0) {
+      matches++
+      usedJ.add(bestJ)
+    }
+  }
+  
+  return original.length > 0 ? matches / original.length : 0
+}
 
-  const originalWords = normalizedOriginal.split(' ').filter(w => w.length > 0)
-  const recitedWords = normalizedRecited.split(' ').filter(w => w.length > 0)
+// ============= Main Analysis Function =============
+interface AyahData { number: number; text: string; simpleText?: string }
 
-  const wordDiff = getWordDiff(originalWords, recitedWords)
-
-  // Calculate scores
+function analyzeRecitationAdvanced(recitedText: string, originalAyahs: AyahData[]) {
+  // Normalize recited text
+  const normRecited = deepNormalizeArabic(recitedText)
+  const recitedWords = normRecited.split(' ').filter(w => w.length > 0)
+  
+  // Build full original from simple text
+  const fullOriginalSimple = originalAyahs.map(a => a.simpleText || a.text).join(' ')
+  const fullOriginalUthmani = originalAyahs.map(a => a.text).join(' ')
+  const normOriginal = deepNormalizeArabic(fullOriginalSimple)
+  const originalWords = normOriginal.split(' ').filter(w => w.length > 0)
+  
+  // Global word diff
+  const wordDiff = advancedWordDiff(originalWords, recitedWords)
+  
+  // Count results
   const totalWords = originalWords.length
   const correctWords = wordDiff.filter(d => d.type === 'correct').length
+  const fuzzyCorrect = wordDiff.filter(d => d.type === 'correct' && d.fuzzy).length
+  const exactCorrect = correctWords - fuzzyCorrect
   const substitutions = wordDiff.filter(d => d.type === 'substitution')
   const insertions = wordDiff.filter(d => d.type === 'insertion')
   const deletions = wordDiff.filter(d => d.type === 'deletion')
-
+  
   const accuracy = totalWords > 0 ? Math.round((correctWords / totalWords) * 100) : 0
-
+  
   // Character-level similarity
-  const charDistance = levenshteinDistance(normalizedRecited, normalizedOriginal)
-  const maxLen = Math.max(normalizedRecited.length, normalizedOriginal.length)
-  const charSimilarity = maxLen > 0 ? Math.round(((maxLen - charDistance) / maxLen) * 100) : 0
-
-  // Per-ayah analysis
-  const ayahAnalysis = analyzePerAyah(recitedText, originalAyahs)
-
-  // Tajweed hints
-  const tajweedNotes = generateTajweedNotes(substitutions, deletions, originalAyahs)
-
-  // Overall grade
-  let grade = ''
-  let gradeClass = ''
-  if (accuracy >= 95) { grade = 'ممتاز - ما شاء الله'; gradeClass = 'excellent' }
-  else if (accuracy >= 85) { grade = 'جيد جداً'; gradeClass = 'very-good' }
-  else if (accuracy >= 70) { grade = 'جيد - يحتاج مراجعة'; gradeClass = 'good' }
-  else if (accuracy >= 50) { grade = 'مقبول - يحتاج تحسين'; gradeClass = 'acceptable' }
-  else { grade = 'يحتاج إعادة المحاولة'; gradeClass = 'needs-work' }
+  const cDist = charDistance(normRecited, normOriginal)
+  const cMax = Math.max(normRecited.length, normOriginal.length)
+  const charSimilarity = cMax > 0 ? Math.round(((cMax - cDist) / cMax) * 100) : 0
+  
+  // Per-ayah analysis with smart alignment
+  const ayahAnalysis = alignRecitedToAyahs(recitedWords, originalAyahs)
+  
+  // Generate detailed notes
+  const notes = generateDetailedNotes(wordDiff, substitutions, deletions, insertions, accuracy)
+  
+  // Grade
+  let grade = '', gradeClass = '', gradeIcon = ''
+  if (accuracy >= 95) { grade = 'ممتاز - ما شاء الله تبارك الله'; gradeClass = 'excellent'; gradeIcon = 'star' }
+  else if (accuracy >= 85) { grade = 'جيد جداً - أحسنت'; gradeClass = 'very-good'; gradeIcon = 'thumbs-up' }
+  else if (accuracy >= 70) { grade = 'جيد - يحتاج مراجعة بعض المواضع'; gradeClass = 'good'; gradeIcon = 'book-open' }
+  else if (accuracy >= 50) { grade = 'مقبول - يحتاج تحسين ومراجعة'; gradeClass = 'acceptable'; gradeIcon = 'pen' }
+  else { grade = 'يحتاج إعادة المحاولة والممارسة'; gradeClass = 'needs-work'; gradeIcon = 'redo' }
 
   return {
-    accuracy,
-    charSimilarity,
-    grade,
-    gradeClass,
-    totalWords,
-    correctWords,
+    accuracy, charSimilarity, grade, gradeClass, gradeIcon,
+    totalWords, correctWords, exactCorrect, fuzzyCorrect,
     errors: {
       substitutions: substitutions.length,
       insertions: insertions.length,
@@ -238,838 +372,676 @@ function analyzeRecitation(recitedText: string, originalAyahs: AyahData[]) {
     },
     wordDiff,
     ayahAnalysis,
-    tajweedNotes,
-    originalText: fullOriginal,
-    recitedText
+    tajweedNotes: notes,
+    originalText: fullOriginalUthmani,
+    recitedText: recitedText
   }
 }
 
-function analyzePerAyah(recitedText: string, originalAyahs: AyahData[]) {
-  const normalizedRecited = normalizeArabic(recitedText)
-  const results: any[] = []
-
-  // Try to match recited text to each ayah
-  let remainingText = normalizedRecited
-
-  for (const ayah of originalAyahs) {
-    const normalizedAyah = normalizeArabic(ayah.text)
-    const ayahWords = normalizedAyah.split(' ').filter(w => w.length > 0)
-
-    // Find best match in remaining text
-    const recitedWords = remainingText.split(' ').filter(w => w.length > 0)
-    const takeWords = Math.min(ayahWords.length + 3, recitedWords.length)
-    const matchWords = recitedWords.slice(0, takeWords)
-
-    const distance = levenshteinDistance(matchWords.join(' '), normalizedAyah)
-    const maxLen = Math.max(matchWords.join(' ').length, normalizedAyah.length)
-    const similarity = maxLen > 0 ? Math.round(((maxLen - distance) / maxLen) * 100) : 0
-
-    results.push({
-      ayahNumber: ayah.number,
-      originalText: ayah.text,
-      similarity,
-      status: similarity >= 90 ? 'correct' : similarity >= 60 ? 'partial' : 'error'
-    })
-
-    // Remove matched words from remaining
-    remainingText = recitedWords.slice(ayahWords.length).join(' ')
-  }
-
-  return results
-}
-
-function generateTajweedNotes(substitutions: any[], deletions: any[], ayahs: AyahData[]): string[] {
+function generateDetailedNotes(wordDiff: any[], subs: any[], dels: any[], ins: any[], accuracy: number): string[] {
   const notes: string[] = []
-
-  if (substitutions.length > 0) {
-    notes.push(`تم العثور على ${substitutions.length} كلمة مختلفة عن النص الأصلي - راجع الكلمات المحددة باللون الأحمر`)
-
-    // Check for common patterns
-    const subPairs = substitutions.map(s => ({ orig: s.original, rec: s.recited }))
-    for (const pair of subPairs.slice(0, 5)) {
-      if (pair.orig && pair.rec) {
-        const dist = levenshteinDistance(pair.orig, pair.rec)
-        if (dist === 1) {
-          notes.push(`كلمة "${pair.rec}" قريبة من "${pair.orig}" - تأكد من مخرج الحرف الصحيح`)
-        } else if (dist <= 2) {
-          notes.push(`كلمة "${pair.rec}" بدلاً من "${pair.orig}" - راجع نطق الكلمة`)
+  
+  if (accuracy >= 95) {
+    notes.push('ما شاء الله! تلاوة ممتازة ومطابقة للنص القرآني.')
+    if (accuracy < 100) {
+      notes.push('هناك اختلافات طفيفة جداً - قد تكون بسبب التعرف الصوتي.')
+    }
+  }
+  
+  if (subs.length > 0) {
+    notes.push(`تم رصد ${subs.length} كلمة مختلفة عن النص الأصلي:`)
+    for (const s of subs.slice(0, 8)) {
+      if (s.original && s.recited) {
+        const sim = s.similarity || 0
+        if (sim >= 60) {
+          notes.push(`  - "${s.recited}" ← الصحيح: "${s.original}" (تشابه ${sim}% - خطأ طفيف في النطق)`)
+        } else {
+          notes.push(`  - "${s.recited}" ← الصحيح: "${s.original}" (كلمة مختلفة)`)
         }
       }
     }
   }
-
-  if (deletions.length > 0) {
-    notes.push(`تم حذف ${deletions.length} كلمة من النص الأصلي - تأكد من قراءة جميع الكلمات`)
-    const missingWords = deletions.slice(0, 5).map(d => d.original).filter(Boolean)
-    if (missingWords.length > 0) {
-      notes.push(`الكلمات المحذوفة تشمل: ${missingWords.join('، ')}`)
-    }
+  
+  if (dels.length > 0) {
+    const missingWords = dels.map(d => d.original).filter(Boolean).slice(0, 8)
+    notes.push(`تم حذف/تخطي ${dels.length} كلمة:`)
+    notes.push(`  الكلمات: ${missingWords.join(' ، ')}`)
+    notes.push('  نصيحة: حاول القراءة بتمهل وتأكد من قراءة كل كلمة.')
   }
-
-  if (substitutions.length === 0 && deletions.length === 0) {
-    notes.push('ما شاء الله! القراءة مطابقة للنص القرآني')
-    notes.push('استمر في التدرب على أحكام التجويد: الإدغام، الإخفاء، الإقلاب، والإظهار')
+  
+  if (ins.length > 0) {
+    const extraWords = ins.map(d => d.recited).filter(Boolean).slice(0, 5)
+    notes.push(`تم إضافة ${ins.length} كلمة غير موجودة في النص:`)
+    notes.push(`  الكلمات الزائدة: ${extraWords.join(' ، ')}`)
   }
-
+  
+  if (accuracy < 95 && accuracy >= 50) {
+    notes.push('نصائح للتحسين:')
+    notes.push('  - اقرأ الآيات ببطء وتأنٍّ قبل التسجيل.')
+    notes.push('  - ركّز على الكلمات المحددة باللون الأحمر والبرتقالي.')
+    notes.push('  - استمع لقارئ متقن مثل الشيخ المنشاوي أو الحصري ثم حاول مرة أخرى.')
+  }
+  
+  if (accuracy < 50) {
+    notes.push('يبدو أن هناك فرقاً كبيراً - تأكد من:')
+    notes.push('  - أنك تقرأ الآيات الصحيحة المعروضة على الشاشة.')
+    notes.push('  - أن الميكروفون يعمل بشكل جيد والمكان هادئ.')
+    notes.push('  - جرّب الكتابة اليدوية إذا كان التعرف الصوتي غير دقيق.')
+  }
+  
   return notes
 }
 
 // ============= Main Page =============
-app.get('/', (c) => {
-  return c.html(getMainHTML())
-})
+app.get('/', (c) => c.html(getHTML()))
 
-function getMainHTML(): string {
+function getHTML(): string {
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>مُصحِّح التلاوة - تصحيح تلاوة القرآن الكريم</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Noto+Naskh+Arabic:wght@400;500;600;700&family=Cairo:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script>
-      tailwind.config = {
-        theme: {
-          extend: {
-            colors: {
-              gold: { 50: '#fefce8', 100: '#fef9c3', 200: '#fef08a', 300: '#fde047', 400: '#facc15', 500: '#eab308', 600: '#ca8a04', 700: '#a16207', 800: '#854d0e', 900: '#713f12' },
-              quran: { 50: '#f0fdf4', 100: '#dcfce7', 200: '#bbf7d0', 300: '#86efac', 400: '#4ade80', 500: '#22c55e', 600: '#16a34a', 700: '#15803d', 800: '#166534', 900: '#14532d', 950: '#052e16' }
-            },
-            fontFamily: {
-              amiri: ['Amiri', 'serif'],
-              naskh: ['Noto Naskh Arabic', 'serif'],
-              cairo: ['Cairo', 'sans-serif']
-            }
-          }
-        }
-      }
-    </script>
-    <style>
-      * { box-sizing: border-box; }
-      body { font-family: 'Cairo', sans-serif; background: linear-gradient(135deg, #052e16 0%, #14532d 30%, #166534 60%, #052e16 100%); min-height: 100vh; }
-      .quran-text { font-family: 'Amiri', serif; font-size: 1.6rem; line-height: 2.5; }
-      .ayah-number { font-family: 'Noto Naskh Arabic', serif; display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; background: linear-gradient(135deg, #ca8a04, #eab308); color: #052e16; border-radius: 50%; font-size: 0.75rem; font-weight: 700; margin: 0 4px; vertical-align: middle; }
-      .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.1); }
-      .glass-light { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(20px); }
-      .word-correct { color: #22c55e; background: rgba(34, 197, 94, 0.1); padding: 2px 4px; border-radius: 4px; }
-      .word-error { color: #ef4444; background: rgba(239, 68, 68, 0.15); padding: 2px 6px; border-radius: 4px; text-decoration: line-through; text-decoration-color: rgba(239,68,68,0.5); }
-      .word-missing { color: #f97316; background: rgba(249, 115, 22, 0.15); padding: 2px 6px; border-radius: 4px; border-bottom: 2px dashed #f97316; }
-      .word-extra { color: #a855f7; background: rgba(168, 85, 247, 0.15); padding: 2px 6px; border-radius: 4px; font-style: italic; }
-      .recording-pulse { animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite; }
-      @keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); } 70% { box-shadow: 0 0 0 20px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
-      .wave-animation { display: flex; align-items: center; gap: 3px; height: 40px; }
-      .wave-bar { width: 4px; background: #ef4444; border-radius: 2px; animation: wave 1s ease-in-out infinite; }
-      .wave-bar:nth-child(1) { animation-delay: 0s; }
-      .wave-bar:nth-child(2) { animation-delay: 0.1s; }
-      .wave-bar:nth-child(3) { animation-delay: 0.2s; }
-      .wave-bar:nth-child(4) { animation-delay: 0.3s; }
-      .wave-bar:nth-child(5) { animation-delay: 0.4s; }
-      @keyframes wave { 0%, 100% { height: 10px; } 50% { height: 35px; } }
-      .ornament { background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ca8a04' fill-opacity='0.08'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E"); }
-      .score-ring { transition: stroke-dashoffset 1s ease-in-out; }
-      select option { direction: rtl; }
-      .fade-in { animation: fadeIn 0.5s ease-in; }
-      @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-      .surah-select { scrollbar-width: thin; scrollbar-color: #ca8a04 #052e16; }
-      .surah-select::-webkit-scrollbar { width: 8px; }
-      .surah-select::-webkit-scrollbar-track { background: #052e16; border-radius: 4px; }
-      .surah-select::-webkit-scrollbar-thumb { background: #ca8a04; border-radius: 4px; }
-      .bismillah { font-family: 'Amiri', serif; font-size: 1.8rem; color: #ca8a04; text-align: center; margin-bottom: 1rem; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>مُصحِّح التلاوة - تصحيح تلاوة القرآن الكريم</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Amiri+Quran&family=Amiri:wght@400;700&family=Cairo:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script>
+tailwind.config={theme:{extend:{colors:{gold:{50:'#fefce8',100:'#fef9c3',200:'#fef08a',300:'#fde047',400:'#facc15',500:'#eab308',600:'#ca8a04',700:'#a16207',800:'#854d0e',900:'#713f12'},qr:{50:'#f0fdf4',100:'#dcfce7',200:'#bbf7d0',300:'#86efac',400:'#4ade80',500:'#22c55e',600:'#16a34a',700:'#15803d',800:'#166534',900:'#14532d',950:'#052e16'}},fontFamily:{amiri:['Amiri Quran','Amiri','serif'],cairo:['Cairo','sans-serif']}}}}
+</script>
+<style>
+*{box-sizing:border-box}
+body{font-family:'Cairo',sans-serif;background:linear-gradient(135deg,#052e16 0%,#14532d 30%,#166534 60%,#052e16 100%);min-height:100vh}
+.qtext{font-family:'Amiri Quran','Amiri',serif;font-size:1.65rem;line-height:2.8}
+.ayah-num{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;background:linear-gradient(135deg,#ca8a04,#eab308);color:#052e16;border-radius:50%;font-size:0.7rem;font-weight:700;margin:0 3px;vertical-align:middle;font-family:'Cairo',sans-serif}
+.glass{background:rgba(255,255,255,0.06);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1)}
+.w-ok{color:#22c55e;background:rgba(34,197,94,0.12);padding:2px 5px;border-radius:4px;display:inline-block;margin:1px}
+.w-fuzzy{color:#86efac;background:rgba(34,197,94,0.08);padding:2px 5px;border-radius:4px;display:inline-block;margin:1px;border-bottom:1px dotted #86efac}
+.w-err{color:#ef4444;background:rgba(239,68,68,0.15);padding:2px 5px;border-radius:4px;display:inline-block;margin:1px;position:relative}
+.w-err .w-fix{position:absolute;top:-1.4em;right:0;font-size:0.6em;color:#fbbf24;white-space:nowrap;font-family:'Cairo'}
+.w-miss{color:#f97316;background:rgba(249,115,22,0.15);padding:2px 5px;border-radius:4px;display:inline-block;margin:1px;border-bottom:2px dashed #f97316}
+.w-extra{color:#a855f7;background:rgba(168,85,247,0.12);padding:2px 5px;border-radius:4px;display:inline-block;margin:1px;text-decoration:line-through;text-decoration-color:rgba(168,85,247,0.5)}
+.rec-pulse{animation:pulse 1.5s cubic-bezier(.215,.61,.355,1) infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,0.5)}70%{box-shadow:0 0 0 20px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
+.wave{display:flex;align-items:center;gap:3px;height:40px}
+.wave i{width:4px;background:#ef4444;border-radius:2px;animation:wv 1s ease-in-out infinite}
+.wave i:nth-child(1){animation-delay:0s}.wave i:nth-child(2){animation-delay:.1s}.wave i:nth-child(3){animation-delay:.2s}.wave i:nth-child(4){animation-delay:.3s}.wave i:nth-child(5){animation-delay:.15s}.wave i:nth-child(6){animation-delay:.25s}.wave i:nth-child(7){animation-delay:.05s}
+@keyframes wv{0%,100%{height:8px}50%{height:36px}}
+.ornament{background-image:url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ca8a04' fill-opacity='0.06'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E")}
+.score-ring{transition:stroke-dashoffset 1.2s ease-in-out}
+.fade-in{animation:fi .4s ease}
+@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.live-word{display:inline-block;padding:2px 4px;margin:1px;border-radius:4px;transition:all 0.3s}
+.live-word.pending{color:rgba(255,255,255,0.35)}
+.live-word.active{color:#facc15;background:rgba(250,204,21,0.15);transform:scale(1.05)}
+.live-word.done-ok{color:#22c55e;background:rgba(34,197,94,0.1)}
+.live-word.done-err{color:#ef4444;background:rgba(239,68,68,0.12)}
+.live-word.done-skip{color:#f97316;background:rgba(249,115,22,0.1)}
+</style>
 </head>
 <body class="ornament">
-    <!-- Header -->
-    <header class="glass border-b border-gold-700/30">
-        <div class="max-w-6xl mx-auto px-4 py-4">
-            <div class="flex items-center justify-between">
-                <div class="flex items-center gap-3">
-                    <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-gold-500 to-gold-700 flex items-center justify-center shadow-lg">
-                        <i class="fas fa-book-quran text-xl text-quran-950"></i>
-                    </div>
-                    <div>
-                        <h1 class="text-xl font-bold text-gold-400 font-cairo">مُصحِّح التلاوة</h1>
-                        <p class="text-xs text-green-300/70">تصحيح تلاوة القرآن الكريم آلياً</p>
-                    </div>
-                </div>
-                <div class="flex items-center gap-2">
-                    <span class="px-3 py-1 rounded-full glass text-gold-400 text-xs font-cairo">
-                        <i class="fas fa-microphone-lines ml-1"></i>
-                        التعرف الصوتي
-                    </span>
-                </div>
-            </div>
-        </div>
-    </header>
+<header class="glass border-b border-gold-700/30">
+<div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+<div class="flex items-center gap-3">
+<div class="w-11 h-11 rounded-xl bg-gradient-to-br from-gold-500 to-gold-700 flex items-center justify-center shadow-lg">
+<i class="fas fa-book-quran text-lg text-qr-950"></i>
+</div>
+<div>
+<h1 class="text-lg font-bold text-gold-400 font-cairo">مُصحِّح التلاوة</h1>
+<p class="text-[10px] text-green-300/60">تصحيح تلاوة القرآن الكريم بدقة عالية</p>
+</div>
+</div>
+<div class="flex gap-2">
+<span id="modeIndicator" class="px-3 py-1 rounded-full glass text-gold-400 text-xs font-cairo hidden">
+<i class="fas fa-bolt ml-1"></i> تتبع فوري
+</span>
+</div>
+</div>
+</header>
 
-    <main class="max-w-6xl mx-auto px-4 py-8 space-y-6">
-        <!-- Step 1: Select Surah & Ayahs -->
-        <section class="glass rounded-2xl p-6 fade-in">
-            <div class="flex items-center gap-2 mb-4">
-                <span class="w-8 h-8 rounded-lg bg-gold-600 flex items-center justify-center text-white text-sm font-bold">1</span>
-                <h2 class="text-lg font-bold text-gold-400 font-cairo">اختر السورة والآيات</h2>
-            </div>
-            
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                    <label class="block text-green-300/80 text-sm mb-2 font-cairo">السورة</label>
-                    <select id="surahSelect" class="w-full bg-quran-950/50 text-white border border-gold-700/30 rounded-xl px-4 py-3 font-cairo focus:outline-none focus:border-gold-500 surah-select" onchange="onSurahChange()">
-                        <option value="">-- اختر السورة --</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-green-300/80 text-sm mb-2 font-cairo">من الآية</label>
-                    <input type="number" id="ayahFrom" min="1" value="1" class="w-full bg-quran-950/50 text-white border border-gold-700/30 rounded-xl px-4 py-3 font-cairo focus:outline-none focus:border-gold-500" onchange="loadAyahs()">
-                </div>
-                <div>
-                    <label class="block text-green-300/80 text-sm mb-2 font-cairo">إلى الآية</label>
-                    <input type="number" id="ayahTo" min="1" value="7" class="w-full bg-quran-950/50 text-white border border-gold-700/30 rounded-xl px-4 py-3 font-cairo focus:outline-none focus:border-gold-500" onchange="loadAyahs()">
-                </div>
-            </div>
+<main class="max-w-5xl mx-auto px-4 py-6 space-y-5">
 
-            <button id="loadBtn" onclick="loadAyahs()" class="mt-4 bg-gradient-to-l from-gold-600 to-gold-700 hover:from-gold-500 hover:to-gold-600 text-quran-950 font-bold py-3 px-8 rounded-xl font-cairo transition-all flex items-center gap-2 mx-auto">
-                <i class="fas fa-book-open"></i>
-                عرض الآيات
-            </button>
-        </section>
+<!-- Step 1 -->
+<section class="glass rounded-2xl p-5 fade-in">
+<div class="flex items-center gap-2 mb-3">
+<span class="w-7 h-7 rounded-lg bg-gold-600 flex items-center justify-center text-white text-xs font-bold">1</span>
+<h2 class="text-base font-bold text-gold-400 font-cairo">اختر السورة والآيات</h2>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+<div class="md:col-span-2">
+<label class="block text-green-300/70 text-xs mb-1 font-cairo">السورة</label>
+<select id="surahSel" class="w-full bg-qr-950/50 text-white border border-gold-700/30 rounded-xl px-3 py-2.5 font-cairo text-sm focus:outline-none focus:border-gold-500" onchange="onSurahChange()">
+<option value="">-- اختر السورة --</option>
+</select>
+</div>
+<div>
+<label class="block text-green-300/70 text-xs mb-1 font-cairo">من آية</label>
+<input type="number" id="ayFrom" min="1" value="1" class="w-full bg-qr-950/50 text-white border border-gold-700/30 rounded-xl px-3 py-2.5 font-cairo text-sm focus:outline-none focus:border-gold-500">
+</div>
+<div>
+<label class="block text-green-300/70 text-xs mb-1 font-cairo">إلى آية</label>
+<input type="number" id="ayTo" min="1" value="7" class="w-full bg-qr-950/50 text-white border border-gold-700/30 rounded-xl px-3 py-2.5 font-cairo text-sm focus:outline-none focus:border-gold-500">
+</div>
+</div>
+<div class="flex items-center gap-3 mt-3">
+<button id="loadBtn" onclick="loadAyahs()" class="bg-gradient-to-l from-gold-600 to-gold-700 hover:from-gold-500 hover:to-gold-600 text-qr-950 font-bold py-2.5 px-6 rounded-xl font-cairo text-sm transition-all flex items-center gap-2">
+<i class="fas fa-book-open"></i> عرض الآيات
+</button>
+<label class="flex items-center gap-2 text-green-300/60 text-xs font-cairo cursor-pointer">
+<input type="checkbox" id="liveMode" checked class="accent-gold-500 w-4 h-4"> تفعيل التتبع الفوري أثناء القراءة
+</label>
+</div>
+</section>
 
-        <!-- Quran Display -->
-        <section id="quranDisplay" class="hidden glass rounded-2xl p-6 fade-in">
-            <div class="flex items-center justify-between mb-4">
-                <div class="flex items-center gap-2">
-                    <span class="w-8 h-8 rounded-lg bg-gold-600 flex items-center justify-center text-white text-sm font-bold">2</span>
-                    <h2 class="text-lg font-bold text-gold-400 font-cairo">النص القرآني</h2>
-                </div>
-                <span id="surahTitle" class="text-gold-500 font-amiri text-lg"></span>
-            </div>
-            
-            <div class="bg-quran-950/40 rounded-xl p-6 border border-gold-700/20">
-                <div class="bismillah" id="bismillah"></div>
-                <div id="ayahsContainer" class="quran-text text-white text-center leading-[3]"></div>
-            </div>
-            <p class="text-green-300/60 text-xs mt-2 text-center font-cairo">
-                <i class="fas fa-info-circle ml-1"></i>
-                اقرأ الآيات أعلاه ثم سجّل تلاوتك بالضغط على زر التسجيل
-            </p>
-        </section>
+<!-- Quran Display + Live Tracking -->
+<section id="quranBox" class="hidden glass rounded-2xl p-5 fade-in">
+<div class="flex items-center justify-between mb-3">
+<div class="flex items-center gap-2">
+<span class="w-7 h-7 rounded-lg bg-gold-600 flex items-center justify-center text-white text-xs font-bold">2</span>
+<h2 class="text-base font-bold text-gold-400 font-cairo">النص القرآني</h2>
+</div>
+<span id="surahTitle" class="text-gold-500 font-amiri text-base"></span>
+</div>
+<div class="bg-qr-950/40 rounded-xl p-5 border border-gold-700/20">
+<div id="bismillah" class="font-amiri text-xl text-gold-500 text-center mb-3"></div>
+<div id="liveContainer" class="qtext text-white text-center leading-[3]"></div>
+</div>
+<p class="text-green-300/50 text-[10px] mt-2 text-center font-cairo">
+<i class="fas fa-info-circle ml-1"></i>
+في وضع التتبع الفوري: الكلمات تتلوّن مباشرة أثناء قراءتك
+</p>
+</section>
 
-        <!-- Step 2: Record -->
-        <section id="recordSection" class="hidden glass rounded-2xl p-6 fade-in">
-            <div class="flex items-center gap-2 mb-4">
-                <span class="w-8 h-8 rounded-lg bg-gold-600 flex items-center justify-center text-white text-sm font-bold">3</span>
-                <h2 class="text-lg font-bold text-gold-400 font-cairo">سجّل تلاوتك</h2>
-            </div>
+<!-- Step 3: Record -->
+<section id="recSection" class="hidden glass rounded-2xl p-5 fade-in">
+<div class="flex items-center gap-2 mb-3">
+<span class="w-7 h-7 rounded-lg bg-gold-600 flex items-center justify-center text-white text-xs font-bold">3</span>
+<h2 class="text-base font-bold text-gold-400 font-cairo">سجّل تلاوتك</h2>
+</div>
+<div class="text-center space-y-3">
+<button id="recBtn" onclick="toggleRec()" class="w-20 h-20 rounded-full bg-gradient-to-br from-red-500 to-red-700 hover:from-red-400 hover:to-red-600 text-white text-2xl shadow-2xl transition-all mx-auto flex items-center justify-center">
+<i class="fas fa-microphone"></i>
+</button>
+<p id="recStatus" class="text-green-300/60 text-xs font-cairo">اضغط لبدء التسجيل</p>
+<div id="waveBox" class="hidden justify-center"><div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
 
-            <div class="text-center space-y-4">
-                <!-- Recording button -->
-                <button id="recordBtn" onclick="toggleRecording()" class="w-24 h-24 rounded-full bg-gradient-to-br from-red-500 to-red-700 hover:from-red-400 hover:to-red-600 text-white text-3xl shadow-2xl transition-all mx-auto flex items-center justify-center">
-                    <i class="fas fa-microphone"></i>
-                </button>
-                <p id="recordStatus" class="text-green-300/70 text-sm font-cairo">اضغط للبدء بالتسجيل</p>
-                
-                <!-- Wave animation (hidden by default) -->
-                <div id="waveContainer" class="hidden justify-center">
-                    <div class="wave-animation">
-                        <div class="wave-bar"></div>
-                        <div class="wave-bar"></div>
-                        <div class="wave-bar"></div>
-                        <div class="wave-bar"></div>
-                        <div class="wave-bar"></div>
-                    </div>
-                </div>
+<div id="recPreview" class="hidden bg-qr-950/40 rounded-xl p-3 border border-gold-700/20 text-right">
+<p class="text-[10px] text-gold-500/60 mb-1 font-cairo"><i class="fas fa-language ml-1"></i> النص المُتعرَّف عليه:</p>
+<p id="recText" class="qtext text-white text-base"></p>
+</div>
 
-                <!-- Recognized text preview -->
-                <div id="recognizedPreview" class="hidden bg-quran-950/40 rounded-xl p-4 border border-gold-700/20 text-right">
-                    <p class="text-xs text-gold-500/70 mb-2 font-cairo"><i class="fas fa-language ml-1"></i> النص المُتعرَّف عليه:</p>
-                    <p id="recognizedText" class="quran-text text-white text-lg"></p>
-                </div>
+<div class="border-t border-gold-700/20 pt-3 mt-3">
+<button onclick="toggleManual()" class="text-gold-400 text-xs font-cairo hover:text-gold-300 transition-colors">
+<i class="fas fa-keyboard ml-1"></i> أو اكتب التلاوة يدوياً
+</button>
+<div id="manualBox" class="hidden mt-2">
+<textarea id="manualTxt" rows="3" class="w-full bg-qr-950/50 text-white border border-gold-700/30 rounded-xl px-3 py-2 font-amiri text-base focus:outline-none focus:border-gold-500 resize-none text-right" placeholder="اكتب التلاوة هنا..."></textarea>
+</div>
+</div>
 
-                <!-- Manual input option -->
-                <div class="border-t border-gold-700/20 pt-4 mt-4">
-                    <button onclick="toggleManualInput()" class="text-gold-400 text-sm font-cairo hover:text-gold-300 transition-colors">
-                        <i class="fas fa-keyboard ml-1"></i>
-                        أو اكتب التلاوة يدوياً
-                    </button>
-                    <div id="manualInput" class="hidden mt-3">
-                        <textarea id="manualText" rows="4" class="w-full bg-quran-950/50 text-white border border-gold-700/30 rounded-xl px-4 py-3 font-amiri text-lg focus:outline-none focus:border-gold-500 resize-none text-right" placeholder="اكتب التلاوة هنا..."></textarea>
-                    </div>
-                </div>
+<button id="analyzeBtn" onclick="doAnalyze()" class="hidden bg-gradient-to-l from-emerald-600 to-emerald-700 hover:from-emerald-500 hover:to-emerald-600 text-white font-bold py-2.5 px-8 rounded-xl font-cairo text-sm transition-all shadow-lg">
+<i class="fas fa-magnifying-glass-chart ml-2"></i> تحليل التلاوة
+</button>
+</div>
+</section>
 
-                <!-- Analyze button -->
-                <button id="analyzeBtn" onclick="analyzeRecitation()" class="hidden bg-gradient-to-l from-emerald-600 to-emerald-700 hover:from-emerald-500 hover:to-emerald-600 text-white font-bold py-3 px-10 rounded-xl font-cairo transition-all shadow-lg">
-                    <i class="fas fa-magnifying-glass-chart ml-2"></i>
-                    تحليل التلاوة
-                </button>
-            </div>
-        </section>
+<!-- Loading -->
+<div id="loadingBox" class="hidden text-center py-10">
+<i class="fas fa-spinner fa-spin text-gold-400 text-3xl"></i>
+<p class="text-green-300/60 mt-2 font-cairo text-sm">جاري التحليل المتقدم...</p>
+</div>
 
-        <!-- Loading -->
-        <div id="loadingSection" class="hidden text-center py-12">
-            <div class="inline-block">
-                <i class="fas fa-spinner fa-spin text-gold-400 text-4xl"></i>
-                <p class="text-green-300/70 mt-3 font-cairo">جاري تحليل التلاوة...</p>
-            </div>
-        </div>
+<!-- Results -->
+<section id="results" class="hidden space-y-5 fade-in">
 
-        <!-- Results -->
-        <section id="resultsSection" class="hidden space-y-6 fade-in">
-            <!-- Score Card -->
-            <div class="glass rounded-2xl p-6">
-                <div class="flex items-center gap-2 mb-6">
-                    <span class="w-8 h-8 rounded-lg bg-gold-600 flex items-center justify-center text-white text-sm font-bold">4</span>
-                    <h2 class="text-lg font-bold text-gold-400 font-cairo">نتيجة التقييم</h2>
-                </div>
+<!-- Score -->
+<div class="glass rounded-2xl p-5">
+<div class="flex items-center gap-2 mb-4">
+<span class="w-7 h-7 rounded-lg bg-gold-600 flex items-center justify-center text-white text-xs font-bold">4</span>
+<h2 class="text-base font-bold text-gold-400 font-cairo">نتيجة التقييم</h2>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+<div class="flex flex-col items-center">
+<div class="relative w-36 h-36">
+<svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+<circle cx="50" cy="50" r="45" stroke="rgba(255,255,255,0.08)" stroke-width="7" fill="none"/>
+<circle id="scoreRing" cx="50" cy="50" r="45" stroke="#22c55e" stroke-width="7" fill="none" stroke-linecap="round" stroke-dasharray="283" stroke-dashoffset="283" class="score-ring"/>
+</svg>
+<div class="absolute inset-0 flex flex-col items-center justify-center">
+<span id="scorePct" class="text-3xl font-bold text-white">0%</span>
+<span class="text-[10px] text-green-300/50 font-cairo">الدقة</span>
+</div>
+</div>
+<p id="gradeText" class="mt-2 text-sm font-bold font-cairo text-gold-400 text-center"></p>
+</div>
+<div class="space-y-2">
+<h3 class="text-gold-500 font-cairo font-semibold text-sm mb-2"><i class="fas fa-chart-bar ml-1"></i> إحصائيات</h3>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5"><span class="text-green-300/60 text-xs font-cairo">إجمالي الكلمات</span><span id="sTotal" class="text-white font-bold text-sm">0</span></div>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5"><span class="text-green-300/60 text-xs font-cairo">صحيح (مطابق)</span><span id="sExact" class="text-green-400 font-bold text-sm">0</span></div>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5"><span class="text-green-300/60 text-xs font-cairo">صحيح (تقريبي)</span><span id="sFuzzy" class="text-green-300 font-bold text-sm">0</span></div>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5"><span class="text-green-300/60 text-xs font-cairo">التشابه الحرفي</span><span id="sChar" class="text-gold-400 font-bold text-sm">0%</span></div>
+</div>
+<div class="space-y-2">
+<h3 class="text-gold-500 font-cairo font-semibold text-sm mb-2"><i class="fas fa-triangle-exclamation ml-1"></i> الأخطاء</h3>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5"><span class="text-green-300/60 text-xs font-cairo flex items-center gap-1"><span class="w-2.5 h-2.5 rounded bg-red-500"></span>كلمات خاطئة</span><span id="sSub" class="text-red-400 font-bold text-sm">0</span></div>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5"><span class="text-green-300/60 text-xs font-cairo flex items-center gap-1"><span class="w-2.5 h-2.5 rounded bg-orange-500"></span>كلمات محذوفة</span><span id="sDel" class="text-orange-400 font-bold text-sm">0</span></div>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5"><span class="text-green-300/60 text-xs font-cairo flex items-center gap-1"><span class="w-2.5 h-2.5 rounded bg-purple-500"></span>كلمات زائدة</span><span id="sIns" class="text-purple-400 font-bold text-sm">0</span></div>
+<div class="flex justify-between bg-qr-950/30 rounded-lg px-3 py-1.5 border border-gold-700/20"><span class="text-gold-400/80 text-xs font-cairo font-semibold">إجمالي الأخطاء</span><span id="sErrTot" class="text-red-400 font-bold text-sm">0</span></div>
+</div>
+</div>
+</div>
 
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <!-- Score Ring -->
-                    <div class="flex flex-col items-center">
-                        <div class="relative w-40 h-40">
-                            <svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
-                                <circle cx="50" cy="50" r="45" stroke="rgba(255,255,255,0.1)" stroke-width="8" fill="none"/>
-                                <circle id="scoreRing" cx="50" cy="50" r="45" stroke="#22c55e" stroke-width="8" fill="none" stroke-linecap="round" stroke-dasharray="283" stroke-dashoffset="283" class="score-ring"/>
-                            </svg>
-                            <div class="absolute inset-0 flex flex-col items-center justify-center">
-                                <span id="scorePercent" class="text-3xl font-bold text-white">0%</span>
-                                <span class="text-xs text-green-300/60 font-cairo">الدقة</span>
-                            </div>
-                        </div>
-                        <p id="gradeText" class="mt-3 text-lg font-bold font-cairo text-gold-400"></p>
-                    </div>
+<!-- Comparison -->
+<div class="glass rounded-2xl p-5">
+<h3 class="text-gold-400 font-cairo font-bold text-sm mb-3 flex items-center gap-2"><i class="fas fa-code-compare"></i> المقارنة التفصيلية كلمة بكلمة</h3>
+<div class="bg-qr-950/40 rounded-xl p-5 border border-gold-700/20">
+<div id="compView" class="qtext text-base leading-[3] text-right"></div>
+</div>
+<div class="flex flex-wrap gap-3 mt-3 justify-center">
+<span class="flex items-center gap-1 text-[10px] font-cairo"><span class="w-2.5 h-2.5 rounded bg-green-500"></span><span class="text-green-300/60">صحيح</span></span>
+<span class="flex items-center gap-1 text-[10px] font-cairo"><span class="w-2.5 h-2.5 rounded bg-green-300"></span><span class="text-green-300/60">صحيح (تقريبي)</span></span>
+<span class="flex items-center gap-1 text-[10px] font-cairo"><span class="w-2.5 h-2.5 rounded bg-red-500"></span><span class="text-green-300/60">خطأ</span></span>
+<span class="flex items-center gap-1 text-[10px] font-cairo"><span class="w-2.5 h-2.5 rounded bg-orange-500"></span><span class="text-green-300/60">محذوف</span></span>
+<span class="flex items-center gap-1 text-[10px] font-cairo"><span class="w-2.5 h-2.5 rounded bg-purple-500"></span><span class="text-green-300/60">زائد</span></span>
+</div>
+</div>
 
-                    <!-- Stats -->
-                    <div class="space-y-3">
-                        <h3 class="text-gold-500 font-cairo font-semibold mb-3"><i class="fas fa-chart-bar ml-1"></i> إحصائيات التلاوة</h3>
-                        <div class="flex justify-between items-center bg-quran-950/30 rounded-lg px-4 py-2">
-                            <span class="text-green-300/70 text-sm font-cairo">إجمالي الكلمات</span>
-                            <span id="statTotal" class="text-white font-bold">0</span>
-                        </div>
-                        <div class="flex justify-between items-center bg-quran-950/30 rounded-lg px-4 py-2">
-                            <span class="text-green-300/70 text-sm font-cairo">الكلمات الصحيحة</span>
-                            <span id="statCorrect" class="text-green-400 font-bold">0</span>
-                        </div>
-                        <div class="flex justify-between items-center bg-quran-950/30 rounded-lg px-4 py-2">
-                            <span class="text-green-300/70 text-sm font-cairo">الأخطاء</span>
-                            <span id="statErrors" class="text-red-400 font-bold">0</span>
-                        </div>
-                        <div class="flex justify-between items-center bg-quran-950/30 rounded-lg px-4 py-2">
-                            <span class="text-green-300/70 text-sm font-cairo">التشابه الحرفي</span>
-                            <span id="statCharSim" class="text-gold-400 font-bold">0%</span>
-                        </div>
-                    </div>
+<!-- Per Ayah -->
+<div class="glass rounded-2xl p-5">
+<h3 class="text-gold-400 font-cairo font-bold text-sm mb-3 flex items-center gap-2"><i class="fas fa-list-check"></i> تحليل كل آية</h3>
+<div id="ayahBox" class="space-y-2"></div>
+</div>
 
-                    <!-- Error Breakdown -->
-                    <div class="space-y-3">
-                        <h3 class="text-gold-500 font-cairo font-semibold mb-3"><i class="fas fa-triangle-exclamation ml-1"></i> تفصيل الأخطاء</h3>
-                        <div class="flex justify-between items-center bg-quran-950/30 rounded-lg px-4 py-2">
-                            <span class="text-green-300/70 text-sm font-cairo flex items-center gap-1">
-                                <span class="w-3 h-3 rounded bg-red-500 inline-block"></span>
-                                كلمات خاطئة
-                            </span>
-                            <span id="statSub" class="text-red-400 font-bold">0</span>
-                        </div>
-                        <div class="flex justify-between items-center bg-quran-950/30 rounded-lg px-4 py-2">
-                            <span class="text-green-300/70 text-sm font-cairo flex items-center gap-1">
-                                <span class="w-3 h-3 rounded bg-orange-500 inline-block"></span>
-                                كلمات محذوفة
-                            </span>
-                            <span id="statDel" class="text-orange-400 font-bold">0</span>
-                        </div>
-                        <div class="flex justify-between items-center bg-quran-950/30 rounded-lg px-4 py-2">
-                            <span class="text-green-300/70 text-sm font-cairo flex items-center gap-1">
-                                <span class="w-3 h-3 rounded bg-purple-500 inline-block"></span>
-                                كلمات زائدة
-                            </span>
-                            <span id="statIns" class="text-purple-400 font-bold">0</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
+<!-- Notes -->
+<div class="glass rounded-2xl p-5">
+<h3 class="text-gold-400 font-cairo font-bold text-sm mb-3 flex items-center gap-2"><i class="fas fa-lightbulb"></i> ملاحظات وتوجيهات</h3>
+<div id="notesBox" class="space-y-1.5"></div>
+</div>
 
-            <!-- Detailed Comparison -->
-            <div class="glass rounded-2xl p-6">
-                <h3 class="text-gold-400 font-cairo font-bold mb-4 flex items-center gap-2">
-                    <i class="fas fa-code-compare"></i>
-                    المقارنة التفصيلية
-                </h3>
-                <div class="bg-quran-950/40 rounded-xl p-6 border border-gold-700/20">
-                    <div id="comparisonView" class="quran-text text-lg leading-[3] text-right"></div>
-                </div>
-                <div class="flex flex-wrap gap-4 mt-4 justify-center">
-                    <span class="flex items-center gap-1 text-xs font-cairo">
-                        <span class="w-3 h-3 rounded bg-green-500 inline-block"></span>
-                        <span class="text-green-300/70">صحيح</span>
-                    </span>
-                    <span class="flex items-center gap-1 text-xs font-cairo">
-                        <span class="w-3 h-3 rounded bg-red-500 inline-block"></span>
-                        <span class="text-green-300/70">خطأ (استبدال)</span>
-                    </span>
-                    <span class="flex items-center gap-1 text-xs font-cairo">
-                        <span class="w-3 h-3 rounded bg-orange-500 inline-block"></span>
-                        <span class="text-green-300/70">محذوف</span>
-                    </span>
-                    <span class="flex items-center gap-1 text-xs font-cairo">
-                        <span class="w-3 h-3 rounded bg-purple-500 inline-block"></span>
-                        <span class="text-green-300/70">زائد</span>
-                    </span>
-                </div>
-            </div>
+<!-- Retry -->
+<div class="text-center">
+<button onclick="resetAll()" class="bg-gradient-to-l from-gold-600 to-gold-700 hover:from-gold-500 hover:to-gold-600 text-qr-950 font-bold py-2.5 px-8 rounded-xl font-cairo text-sm transition-all shadow-lg">
+<i class="fas fa-redo ml-2"></i> إعادة المحاولة
+</button>
+</div>
+</section>
+</main>
 
-            <!-- Per-Ayah Analysis -->
-            <div class="glass rounded-2xl p-6">
-                <h3 class="text-gold-400 font-cairo font-bold mb-4 flex items-center gap-2">
-                    <i class="fas fa-list-check"></i>
-                    تحليل كل آية
-                </h3>
-                <div id="ayahAnalysis" class="space-y-3"></div>
-            </div>
+<footer class="glass border-t border-gold-700/30 mt-10 py-4">
+<div class="max-w-5xl mx-auto px-4 text-center">
+<p class="text-green-300/40 text-[10px] font-cairo">مُصحِّح التلاوة - تصحيح تلاوة القرآن الكريم بدقة عالية باستخدام خوارزميات المطابقة الذكية</p>
+</div>
+</footer>
 
-            <!-- Tajweed Notes -->
-            <div class="glass rounded-2xl p-6">
-                <h3 class="text-gold-400 font-cairo font-bold mb-4 flex items-center gap-2">
-                    <i class="fas fa-lightbulb"></i>
-                    ملاحظات وتوجيهات
-                </h3>
-                <div id="tajweedNotes" class="space-y-2"></div>
-            </div>
+<script>
+// ====== State ======
+let surahs=[],currentAyahs=[],currentSurahNum=0,isRec=false,recognition=null,finalTx='',interimTx='';
+let liveWords=[],liveWordIdx=0,liveActive=false;
 
-            <!-- Retry Button -->
-            <div class="text-center">
-                <button onclick="resetAll()" class="bg-gradient-to-l from-gold-600 to-gold-700 hover:from-gold-500 hover:to-gold-600 text-quran-950 font-bold py-3 px-10 rounded-xl font-cairo transition-all shadow-lg">
-                    <i class="fas fa-redo ml-2"></i>
-                    إعادة المحاولة
-                </button>
-            </div>
-        </section>
-    </main>
+// ====== Arabic Normalization (Client-side mirror) ======
+function norm(t){
+  return t.replace(/[\\uFEFF\\u200B-\\u200F\\u00A0]/g,'')
+    .replace(/[\\u0610-\\u061A\\u064B-\\u065F\\u0670\\u06D6-\\u06DC\\u06DF-\\u06E8\\u06EA-\\u06ED\\u08D3-\\u08E1\\u08E3-\\u08FF\\uFE70-\\uFE7F]/g,'')
+    .replace(/[\\u0622\\u0623\\u0625\\u0671\\u0672\\u0673\\u0675]/g,'\\u0627')
+    .replace(/[\\u0624]/g,'\\u0648')
+    .replace(/[\\u0626]/g,'\\u064A')
+    .replace(/[\\u0621]/g,'')
+    .replace(/\\u0629/g,'\\u0647')
+    .replace(/\\u0649/g,'\\u064A')
+    .replace(/\\u0640/g,'')
+    .replace(/[\\uFEF5-\\uFEFC]/g,'\\u0644\\u0627')
+    .replace(/\\s+/g,' ').trim();
+}
 
-    <!-- Footer -->
-    <footer class="glass border-t border-gold-700/30 mt-12 py-6">
-        <div class="max-w-6xl mx-auto px-4 text-center">
-            <p class="text-green-300/50 text-sm font-cairo">
-                مُصحِّح التلاوة - أداة لتصحيح تلاوة القرآن الكريم آلياً
-            </p>
-            <p class="text-green-300/30 text-xs mt-1 font-cairo">
-                يستخدم التعرف على الكلام في المتصفح ومقارنة نصية متقدمة
-            </p>
-        </div>
-    </footer>
+function wordSim(a,b){
+  if(a===b)return 1;
+  const m=a.length,n=b.length;
+  if(!m)return n?0:1;if(!n)return 0;
+  const dp=[];
+  for(let i=0;i<=m;i++){dp[i]=[i]}
+  for(let j=1;j<=n;j++){dp[0][j]=j}
+  for(let i=1;i<=m;i++)for(let j=1;j<=n;j++){
+    dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]:1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);
+  }
+  return(Math.max(m,n)-dp[m][n])/Math.max(m,n);
+}
 
-    <script>
-    // ============= State =============
-    let surahs = [];
-    let currentAyahs = [];
-    let currentSurahNumber = 0;
-    let isRecording = false;
-    let recognition = null;
-    let finalTranscript = '';
-    let interimTranscript = '';
+function wordsMatch(a,b,th){
+  th=th||0.78;
+  const na=norm(a),nb=norm(b);
+  if(na===nb)return true;
+  const na2=na.replace(/^\\u0627\\u0644/,''),nb2=nb.replace(/^\\u0627\\u0644/,'');
+  if(na2===nb2&&na2.length>1)return true;
+  if(na===nb2||na2===nb)return true;
+  return wordSim(na,nb)>=th;
+}
 
-    // ============= Initialize =============
-    document.addEventListener('DOMContentLoaded', () => {
-        loadSurahs();
-        initSpeechRecognition();
+// ====== Init ======
+document.addEventListener('DOMContentLoaded',()=>{loadSurahs();initSpeech()});
+
+async function loadSurahs(){
+  try{
+    const r=await fetch('/api/surahs'),d=await r.json();
+    if(d.success){
+      surahs=d.surahs;
+      const sel=document.getElementById('surahSel');
+      surahs.forEach(s=>{const o=document.createElement('option');o.value=s.number;o.textContent=s.number+' - '+s.name+' ('+s.englishName+') - '+s.numberOfAyahs+' آية';sel.appendChild(o)});
+    }
+  }catch(e){console.error(e)}
+}
+
+function onSurahChange(){
+  const n=+document.getElementById('surahSel').value;if(!n)return;
+  const s=surahs.find(x=>x.number===n);
+  if(s){document.getElementById('ayFrom').value=1;document.getElementById('ayTo').value=Math.min(s.numberOfAyahs,10);document.getElementById('ayTo').max=s.numberOfAyahs;document.getElementById('ayFrom').max=s.numberOfAyahs}
+}
+
+async function loadAyahs(){
+  const sn=document.getElementById('surahSel').value,fr=+document.getElementById('ayFrom').value,to=+document.getElementById('ayTo').value;
+  if(!sn||!fr||!to)return;
+  if(fr>to){alert('رقم آية البداية أكبر من النهاية');return}
+  currentSurahNum=+sn;
+  try{
+    document.getElementById('loadBtn').innerHTML='<i class="fas fa-spinner fa-spin ml-1"></i> تحميل...';
+    const r=await fetch('/api/surah/'+sn+'/ayahs/'+fr+'/'+to),d=await r.json();
+    if(d.success){
+      currentAyahs=d.ayahs;
+      displayQuran(d);
+      document.getElementById('quranBox').classList.remove('hidden');
+      document.getElementById('recSection').classList.remove('hidden');
+      document.getElementById('results').classList.add('hidden');
+      resetLiveTracking();
+      document.getElementById('quranBox').scrollIntoView({behavior:'smooth'});
+    }
+  }catch(e){alert('خطأ في التحميل')}
+  finally{document.getElementById('loadBtn').innerHTML='<i class="fas fa-book-open ml-1"></i> عرض الآيات'}
+}
+
+function displayQuran(d){
+  document.getElementById('surahTitle').textContent=d.surahName||'';
+  const bism=document.getElementById('bismillah');
+  if(currentSurahNum!==1&&currentSurahNum!==9&&+document.getElementById('ayFrom').value===1)
+    bism.textContent='\\u0628\\u0650\\u0633\\u0652\\u0645\\u0650 \\u0671\\u0644\\u0644\\u0651\\u064E\\u0647\\u0650 \\u0671\\u0644\\u0631\\u0651\\u064E\\u062D\\u0652\\u0645\\u064E\\u0670\\u0646\\u0650 \\u0671\\u0644\\u0631\\u0651\\u064E\\u062D\\u0650\\u064A\\u0645\\u0650';
+  else bism.textContent='';
+  
+  // Build live-tracking word spans
+  const container=document.getElementById('liveContainer');
+  let html='';
+  liveWords=[];
+  d.ayahs.forEach((a,ai)=>{
+    const words=a.text.split(/\\s+/).filter(w=>w.length>0);
+    words.forEach((w,wi)=>{
+      const id='lw-'+ai+'-'+wi;
+      liveWords.push({id,word:w,ayahIdx:ai,wordIdx:wi,simpleWord:a.simpleText?norm(a.simpleText).split(' ').filter(x=>x)[wi]||norm(w):norm(w)});
+      html+='<span id="'+id+'" class="live-word pending qtext">'+esc(w)+'</span> ';
     });
+    html+='<span class="ayah-num">'+a.number+'</span> ';
+  });
+  container.innerHTML=html;
+  liveWordIdx=0;
+}
 
-    async function loadSurahs() {
-        try {
-            const res = await fetch('/api/surahs');
-            const data = await res.json();
-            if (data.success) {
-                surahs = data.surahs;
-                const select = document.getElementById('surahSelect');
-                surahs.forEach(s => {
-                    const opt = document.createElement('option');
-                    opt.value = s.number;
-                    opt.textContent = s.number + ' - ' + s.name + ' (' + s.englishName + ') - ' + s.numberOfAyahs + ' آيات';
-                    select.appendChild(opt);
-                });
-            }
-        } catch (err) {
-            console.error('Error loading surahs:', err);
-        }
+function resetLiveTracking(){
+  liveWordIdx=0;liveActive=false;
+  liveWords.forEach(lw=>{
+    const el=document.getElementById(lw.id);
+    if(el){el.className='live-word pending qtext'}
+  });
+}
+
+// ====== Live Tracking ======
+function processLiveWord(spokenWord){
+  if(!document.getElementById('liveMode').checked)return;
+  if(liveWordIdx>=liveWords.length)return;
+  
+  const nSpoken=norm(spokenWord);
+  if(!nSpoken)return;
+  
+  // Try to match current or next few words (handles speech recognition grouping)
+  let bestIdx=-1,bestSim=0;
+  const searchRange=Math.min(liveWordIdx+4,liveWords.length);
+  
+  for(let i=liveWordIdx;i<searchRange;i++){
+    const sim=wordSim(norm(liveWords[i].simpleWord||liveWords[i].word),nSpoken);
+    // Also try without al-
+    const sim2=wordSim(norm(liveWords[i].simpleWord||liveWords[i].word).replace(/^\\u0627\\u0644/,''),nSpoken.replace(/^\\u0627\\u0644/,''));
+    const best=Math.max(sim,sim2);
+    if(best>bestSim){bestSim=best;bestIdx=i}
+  }
+  
+  if(bestSim>=0.65&&bestIdx>=0){
+    // Mark skipped words
+    for(let i=liveWordIdx;i<bestIdx;i++){
+      const el=document.getElementById(liveWords[i].id);
+      if(el)el.className='live-word done-skip qtext';
     }
-
-    function onSurahChange() {
-        const num = parseInt(document.getElementById('surahSelect').value);
-        if (!num) return;
-        const surah = surahs.find(s => s.number === num);
-        if (surah) {
-            document.getElementById('ayahFrom').value = 1;
-            document.getElementById('ayahTo').value = Math.min(surah.numberOfAyahs, 10);
-            document.getElementById('ayahTo').max = surah.numberOfAyahs;
-            document.getElementById('ayahFrom').max = surah.numberOfAyahs;
-        }
+    // Mark matched word
+    const el=document.getElementById(liveWords[bestIdx].id);
+    if(el)el.className='live-word done-ok qtext';
+    liveWordIdx=bestIdx+1;
+    // Highlight next word
+    if(liveWordIdx<liveWords.length){
+      const next=document.getElementById(liveWords[liveWordIdx].id);
+      if(next){next.className='live-word active qtext';next.scrollIntoView({behavior:'smooth',block:'center'})}
     }
-
-    async function loadAyahs() {
-        const surahNum = document.getElementById('surahSelect').value;
-        const from = parseInt(document.getElementById('ayahFrom').value);
-        const to = parseInt(document.getElementById('ayahTo').value);
-
-        if (!surahNum || !from || !to) return;
-        if (from > to) {
-            alert('رقم آية البداية يجب أن يكون أقل من أو يساوي رقم آية النهاية');
-            return;
-        }
-
-        currentSurahNumber = parseInt(surahNum);
-
-        try {
-            document.getElementById('loadBtn').innerHTML = '<i class="fas fa-spinner fa-spin ml-2"></i> جاري التحميل...';
-            
-            const res = await fetch('/api/surah/' + surahNum + '/ayahs/' + from + '/' + to);
-            const data = await res.json();
-
-            if (data.success) {
-                currentAyahs = data.ayahs;
-                displayAyahs(data);
-                document.getElementById('quranDisplay').classList.remove('hidden');
-                document.getElementById('recordSection').classList.remove('hidden');
-                document.getElementById('resultsSection').classList.add('hidden');
-
-                // Scroll to quran display
-                document.getElementById('quranDisplay').scrollIntoView({ behavior: 'smooth' });
-            }
-        } catch (err) {
-            console.error('Error:', err);
-            alert('حدث خطأ في تحميل الآيات');
-        } finally {
-            document.getElementById('loadBtn').innerHTML = '<i class="fas fa-book-open ml-2"></i> عرض الآيات';
-        }
+  } else if(bestSim>=0.4&&bestIdx>=0){
+    // Partial match - mark as error
+    for(let i=liveWordIdx;i<bestIdx;i++){
+      const el=document.getElementById(liveWords[i].id);
+      if(el)el.className='live-word done-skip qtext';
     }
-
-    function displayAyahs(data) {
-        const container = document.getElementById('ayahsContainer');
-        const surahTitle = document.getElementById('surahTitle');
-        const bismillah = document.getElementById('bismillah');
-
-        surahTitle.textContent = data.surahName || '';
-
-        // Show Bismillah for surahs other than Al-Fatiha and At-Tawbah
-        if (currentSurahNumber !== 1 && currentSurahNumber !== 9 && parseInt(document.getElementById('ayahFrom').value) === 1) {
-            bismillah.textContent = 'بِسْمِ ٱللَّهِ ٱلرَّحْمَـٰنِ ٱلرَّحِيمِ';
-        } else {
-            bismillah.textContent = '';
-        }
-
-        let html = '';
-        data.ayahs.forEach(a => {
-            html += '<span class="ayah-text">' + a.text + '</span> ';
-            html += '<span class="ayah-number">' + a.number + '</span> ';
-        });
-        container.innerHTML = html;
+    const el=document.getElementById(liveWords[bestIdx].id);
+    if(el)el.className='live-word done-err qtext';
+    liveWordIdx=bestIdx+1;
+    if(liveWordIdx<liveWords.length){
+      const next=document.getElementById(liveWords[liveWordIdx].id);
+      if(next){next.className='live-word active qtext';next.scrollIntoView({behavior:'smooth',block:'center'})}
     }
+  }
+}
 
-    // ============= Speech Recognition =============
-    function initSpeechRecognition() {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SpeechRecognition) {
-            document.getElementById('recordBtn').style.display = 'none';
-            document.getElementById('recordStatus').textContent = 'المتصفح لا يدعم التعرف الصوتي - استخدم الإدخال اليدوي';
-            document.getElementById('manualInput').classList.remove('hidden');
-            return;
-        }
+// ====== Speech Recognition ======
+function initSpeech(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){document.getElementById('recBtn').title='غير مدعوم';document.getElementById('recStatus').textContent='المتصفح لا يدعم التعرف الصوتي - استخدم الإدخال اليدوي';document.getElementById('manualBox').classList.remove('hidden');return}
+  recognition=new SR();
+  recognition.lang='ar-SA';
+  recognition.continuous=true;
+  recognition.interimResults=true;
+  recognition.maxAlternatives=3;
 
-        recognition = new SpeechRecognition();
-        recognition.lang = 'ar-SA';
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.maxAlternatives = 1;
-
-        recognition.onresult = (event) => {
-            interimTranscript = '';
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                if (event.results[i].isFinal) {
-                    finalTranscript += event.results[i][0].transcript + ' ';
-                } else {
-                    interimTranscript += event.results[i][0].transcript;
-                }
-            }
-            const preview = document.getElementById('recognizedText');
-            preview.textContent = finalTranscript + interimTranscript;
-            document.getElementById('recognizedPreview').classList.remove('hidden');
-            document.getElementById('analyzeBtn').classList.remove('hidden');
-        };
-
-        recognition.onerror = (event) => {
-            console.error('Speech error:', event.error);
-            if (event.error === 'no-speech') {
-                document.getElementById('recordStatus').textContent = 'لم يتم التعرف على أي كلام - حاول مرة أخرى';
-            } else if (event.error === 'not-allowed') {
-                document.getElementById('recordStatus').textContent = 'يرجى السماح بالوصول إلى الميكروفون';
-            }
-        };
-
-        recognition.onend = () => {
-            if (isRecording) {
-                // Restart if still recording
-                try { recognition.start(); } catch(e) {}
-            } else {
-                stopRecordingUI();
-            }
-        };
+  recognition.onresult=(e)=>{
+    interimTx='';
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const transcript=e.results[i][0].transcript;
+      if(e.results[i].isFinal){
+        finalTx+=transcript+' ';
+        // Process each word for live tracking
+        const words=transcript.split(/\\s+/).filter(w=>w.trim());
+        words.forEach(w=>processLiveWord(w));
+      } else {
+        interimTx+=transcript;
+      }
     }
+    document.getElementById('recText').textContent=finalTx+interimTx;
+    document.getElementById('recPreview').classList.remove('hidden');
+    document.getElementById('analyzeBtn').classList.remove('hidden');
+  };
+  recognition.onerror=(e)=>{
+    if(e.error==='no-speech')document.getElementById('recStatus').textContent='لم يُسمع كلام - حاول مرة أخرى';
+    else if(e.error==='not-allowed')document.getElementById('recStatus').textContent='يرجى السماح بالميكروفون';
+  };
+  recognition.onend=()=>{if(isRec)try{recognition.start()}catch(e){}else stopRecUI()};
+}
 
-    function toggleRecording() {
-        if (!recognition) {
-            // Fallback to manual input
-            toggleManualInput();
-            return;
-        }
+function toggleRec(){if(!recognition){toggleManual();return}isRec?stopRec():startRec()}
 
-        if (isRecording) {
-            stopRecording();
-        } else {
-            startRecording();
-        }
+function startRec(){
+  finalTx='';interimTx='';isRec=true;liveActive=true;
+  resetLiveTracking();
+  // Highlight first word
+  if(liveWords.length>0){
+    const el=document.getElementById(liveWords[0].id);
+    if(el)el.className='live-word active qtext';
+  }
+  if(document.getElementById('liveMode').checked)document.getElementById('modeIndicator').classList.remove('hidden');
+  try{recognition.start()}catch(e){recognition.stop();setTimeout(()=>recognition.start(),100)}
+  const btn=document.getElementById('recBtn');
+  btn.classList.add('rec-pulse');btn.innerHTML='<i class="fas fa-stop"></i>';
+  document.getElementById('recStatus').textContent='جاري التسجيل... اقرأ الآيات';
+  document.getElementById('waveBox').classList.remove('hidden');document.getElementById('waveBox').classList.add('flex');
+}
+
+function stopRec(){isRec=false;liveActive=false;if(recognition)recognition.stop();stopRecUI()}
+
+function stopRecUI(){
+  const btn=document.getElementById('recBtn');
+  btn.classList.remove('rec-pulse');btn.innerHTML='<i class="fas fa-microphone"></i>';
+  document.getElementById('recStatus').textContent='تم إيقاف التسجيل';
+  document.getElementById('waveBox').classList.add('hidden');document.getElementById('waveBox').classList.remove('flex');
+  document.getElementById('modeIndicator').classList.add('hidden');
+  if(finalTx.trim())document.getElementById('analyzeBtn').classList.remove('hidden');
+}
+
+function toggleManual(){const m=document.getElementById('manualBox');m.classList.toggle('hidden');if(!m.classList.contains('hidden')){document.getElementById('analyzeBtn').classList.remove('hidden');document.getElementById('manualTxt').focus()}}
+
+// ====== Analysis ======
+async function doAnalyze(){
+  let txt=finalTx.trim();
+  const manual=document.getElementById('manualTxt').value.trim();
+  if(manual)txt=manual;
+  if(!txt){alert('لم يتم التعرف على نص - سجّل مرة أخرى أو اكتب يدوياً');return}
+  if(!currentAyahs.length){alert('اختر السورة والآيات أولاً');return}
+  
+  document.getElementById('loadingBox').classList.remove('hidden');
+  document.getElementById('results').classList.add('hidden');
+  
+  try{
+    const r=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recitedText:txt,originalAyahs:currentAyahs})});
+    const d=await r.json();
+    if(d.success)showResults(d.analysis);else alert('خطأ في التحليل');
+  }catch(e){alert('خطأ في الاتصال')}
+  finally{document.getElementById('loadingBox').classList.add('hidden')}
+}
+
+function showResults(a){
+  document.getElementById('results').classList.remove('hidden');
+  
+  // Score ring
+  const ring=document.getElementById('scoreRing');
+  const off=283-(a.accuracy/100)*283;
+  ring.style.strokeDashoffset=off;
+  ring.style.stroke=a.accuracy>=90?'#22c55e':a.accuracy>=70?'#eab308':a.accuracy>=50?'#f97316':'#ef4444';
+  document.getElementById('scorePct').textContent=a.accuracy+'%';
+  document.getElementById('gradeText').textContent=a.grade;
+  
+  // Stats
+  document.getElementById('sTotal').textContent=a.totalWords;
+  document.getElementById('sExact').textContent=a.exactCorrect;
+  document.getElementById('sFuzzy').textContent=a.fuzzyCorrect;
+  document.getElementById('sChar').textContent=a.charSimilarity+'%';
+  document.getElementById('sSub').textContent=a.errors.substitutions;
+  document.getElementById('sDel').textContent=a.errors.deletions;
+  document.getElementById('sIns').textContent=a.errors.insertions;
+  document.getElementById('sErrTot').textContent=a.errors.total;
+  
+  // Comparison
+  renderComparison(a.wordDiff);
+  
+  // Per ayah
+  renderAyahAnalysis(a.ayahAnalysis);
+  
+  // Notes
+  renderNotes(a.tajweedNotes);
+  
+  document.getElementById('results').scrollIntoView({behavior:'smooth'});
+}
+
+function renderComparison(diff){
+  const c=document.getElementById('compView');
+  let h='';
+  diff.forEach(d=>{
+    switch(d.type){
+      case 'correct':
+        h+=d.fuzzy?'<span class="w-fuzzy" title="تقريبي '+d.similarity+'%">'+esc(d.original)+'</span> ':
+          '<span class="w-ok">'+esc(d.original)+'</span> ';
+        break;
+      case 'substitution':
+        h+='<span class="w-err" title="قرأت: '+esc(d.recited||'')+' | تشابه: '+(d.similarity||0)+'%"><span class="w-fix">'+esc(d.recited||'')+'</span>'+esc(d.original)+'</span> ';
+        break;
+      case 'deletion':
+        h+='<span class="w-miss" title="كلمة محذوفة/لم تُقرأ">'+esc(d.original)+'</span> ';
+        break;
+      case 'insertion':
+        h+='<span class="w-extra" title="كلمة زائدة">'+esc(d.recited||'')+'</span> ';
+        break;
     }
+  });
+  c.innerHTML=h;
+}
 
-    function startRecording() {
-        finalTranscript = '';
-        interimTranscript = '';
-        isRecording = true;
-
-        try {
-            recognition.start();
-        } catch(e) {
-            recognition.stop();
-            setTimeout(() => {
-                recognition.start();
-            }, 100);
-        }
-
-        const btn = document.getElementById('recordBtn');
-        btn.classList.add('recording-pulse');
-        btn.innerHTML = '<i class="fas fa-stop"></i>';
-        btn.classList.remove('from-red-500', 'to-red-700');
-        btn.classList.add('from-red-600', 'to-red-800');
-        document.getElementById('recordStatus').textContent = 'جاري التسجيل... اضغط للإيقاف';
-        document.getElementById('waveContainer').classList.remove('hidden');
-        document.getElementById('waveContainer').classList.add('flex');
+function renderAyahAnalysis(ayahs){
+  const c=document.getElementById('ayahBox');
+  let h='';
+  ayahs.forEach(a=>{
+    const icon=a.status==='correct'?'fa-check-circle':a.status==='partial'?'fa-exclamation-circle':'fa-times-circle';
+    const clr=a.status==='correct'?'text-green-400':a.status==='partial'?'text-yellow-400':'text-red-400';
+    const label=a.status==='correct'?'صحيح':a.status==='partial'?'جزئي':'يحتاج مراجعة';
+    const barClr=a.similarity>=85?'#22c55e':a.similarity>=55?'#eab308':'#ef4444';
+    
+    h+='<div class="bg-qr-950/30 rounded-xl p-3 border border-gold-700/10">';
+    h+='<div class="flex items-center justify-between mb-1">';
+    h+='<div class="flex items-center gap-2"><span class="ayah-num" style="width:24px;height:24px;font-size:0.6rem">'+a.ayahNumber+'</span>';
+    h+='<span class="'+clr+' text-xs font-cairo"><i class="fas '+icon+' ml-1"></i>'+label+'</span>';
+    h+='<span class="text-[10px] text-green-300/40 font-cairo">('+a.correctCount+'/'+a.wordCount+' كلمة)</span></div>';
+    h+='<span class="text-xs font-bold '+clr+'">'+a.similarity+'%</span></div>';
+    
+    // Mini word diff for this ayah
+    if(a.diff&&a.diff.length>0){
+      h+='<div class="qtext text-sm mt-1 text-right">';
+      a.diff.forEach(d=>{
+        if(d.type==='correct')h+='<span class="'+(d.fuzzy?'w-fuzzy':'w-ok')+'" style="font-size:0.85rem">'+esc(d.original)+'</span> ';
+        else if(d.type==='substitution')h+='<span class="w-err" style="font-size:0.85rem">'+esc(d.original)+'</span> ';
+        else if(d.type==='deletion')h+='<span class="w-miss" style="font-size:0.85rem">'+esc(d.original)+'</span> ';
+        else if(d.type==='insertion')h+='<span class="w-extra" style="font-size:0.85rem">'+esc(d.recited||'')+'</span> ';
+      });
+      h+='</div>';
     }
+    
+    h+='<div class="mt-1.5 bg-gray-700/30 rounded-full h-1.5"><div class="h-1.5 rounded-full transition-all" style="width:'+a.similarity+'%;background:'+barClr+'"></div></div>';
+    h+='</div>';
+  });
+  c.innerHTML=h;
+}
 
-    function stopRecording() {
-        isRecording = false;
-        if (recognition) {
-            recognition.stop();
-        }
-        stopRecordingUI();
-    }
+function renderNotes(notes){
+  const c=document.getElementById('notesBox');
+  let h='';
+  notes.forEach(n=>{
+    const isIndented=n.startsWith('  ');
+    const icon=isIndented?'fa-angle-left':'fa-comment-dots';
+    const pad=isIndented?'pr-6':'';
+    h+='<div class="flex items-start gap-2 bg-qr-950/30 rounded-lg px-3 py-2 '+pad+'">';
+    h+='<i class="fas '+icon+' text-gold-500 mt-0.5 text-xs"></i>';
+    h+='<p class="text-green-300/70 text-xs font-cairo leading-relaxed">'+esc(n)+'</p></div>';
+  });
+  c.innerHTML=h;
+}
 
-    function stopRecordingUI() {
-        const btn = document.getElementById('recordBtn');
-        btn.classList.remove('recording-pulse');
-        btn.innerHTML = '<i class="fas fa-microphone"></i>';
-        btn.classList.remove('from-red-600', 'to-red-800');
-        btn.classList.add('from-red-500', 'to-red-700');
-        document.getElementById('recordStatus').textContent = 'تم إيقاف التسجيل';
-        document.getElementById('waveContainer').classList.add('hidden');
-        document.getElementById('waveContainer').classList.remove('flex');
+function esc(t){if(!t)return'';const d=document.createElement('div');d.textContent=t;return d.innerHTML}
 
-        if (finalTranscript.trim()) {
-            document.getElementById('analyzeBtn').classList.remove('hidden');
-        }
-    }
-
-    function toggleManualInput() {
-        const manual = document.getElementById('manualInput');
-        manual.classList.toggle('hidden');
-        if (!manual.classList.contains('hidden')) {
-            document.getElementById('analyzeBtn').classList.remove('hidden');
-            document.getElementById('manualText').focus();
-        }
-    }
-
-    // ============= Analysis =============
-    async function analyzeRecitation() {
-        let recitedText = finalTranscript.trim();
-        
-        // Check manual input
-        const manualText = document.getElementById('manualText').value.trim();
-        if (manualText) {
-            recitedText = manualText;
-        }
-
-        if (!recitedText) {
-            alert('لم يتم التعرف على أي نص. يرجى التسجيل مرة أخرى أو الكتابة يدوياً.');
-            return;
-        }
-
-        if (currentAyahs.length === 0) {
-            alert('يرجى اختيار السورة والآيات أولاً');
-            return;
-        }
-
-        // Show loading
-        document.getElementById('loadingSection').classList.remove('hidden');
-        document.getElementById('resultsSection').classList.add('hidden');
-
-        try {
-            const res = await fetch('/api/analyze', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    recitedText: recitedText,
-                    originalAyahs: currentAyahs
-                })
-            });
-            const data = await res.json();
-
-            if (data.success) {
-                displayResults(data.analysis);
-            } else {
-                alert('حدث خطأ في التحليل');
-            }
-        } catch (err) {
-            console.error('Analysis error:', err);
-            alert('حدث خطأ في الاتصال');
-        } finally {
-            document.getElementById('loadingSection').classList.add('hidden');
-        }
-    }
-
-    function displayResults(analysis) {
-        const resultsSection = document.getElementById('resultsSection');
-        resultsSection.classList.remove('hidden');
-
-        // Animate score ring
-        const ring = document.getElementById('scoreRing');
-        const circumference = 2 * Math.PI * 45; // ~283
-        const offset = circumference - (analysis.accuracy / 100) * circumference;
-        ring.style.strokeDashoffset = offset;
-
-        // Set ring color based on score
-        if (analysis.accuracy >= 90) ring.style.stroke = '#22c55e';
-        else if (analysis.accuracy >= 70) ring.style.stroke = '#eab308';
-        else if (analysis.accuracy >= 50) ring.style.stroke = '#f97316';
-        else ring.style.stroke = '#ef4444';
-
-        document.getElementById('scorePercent').textContent = analysis.accuracy + '%';
-        document.getElementById('gradeText').textContent = analysis.grade;
-
-        // Stats
-        document.getElementById('statTotal').textContent = analysis.totalWords;
-        document.getElementById('statCorrect').textContent = analysis.correctWords;
-        document.getElementById('statErrors').textContent = analysis.errors.total;
-        document.getElementById('statCharSim').textContent = analysis.charSimilarity + '%';
-        document.getElementById('statSub').textContent = analysis.errors.substitutions;
-        document.getElementById('statDel').textContent = analysis.errors.deletions;
-        document.getElementById('statIns').textContent = analysis.errors.insertions;
-
-        // Comparison view
-        displayComparison(analysis.wordDiff);
-
-        // Per-ayah analysis
-        displayAyahAnalysis(analysis.ayahAnalysis);
-
-        // Tajweed notes
-        displayTajweedNotes(analysis.tajweedNotes);
-
-        // Scroll to results
-        resultsSection.scrollIntoView({ behavior: 'smooth' });
-    }
-
-    function displayComparison(wordDiff) {
-        const container = document.getElementById('comparisonView');
-        let html = '';
-
-        wordDiff.forEach(item => {
-            switch (item.type) {
-                case 'correct':
-                    html += '<span class="word-correct">' + escapeHtml(item.original) + '</span> ';
-                    break;
-                case 'substitution':
-                    html += '<span class="word-error" title="القراءة: ' + escapeHtml(item.recited || '') + '">' + escapeHtml(item.original) + '</span> ';
-                    break;
-                case 'deletion':
-                    html += '<span class="word-missing" title="كلمة محذوفة">' + escapeHtml(item.original) + '</span> ';
-                    break;
-                case 'insertion':
-                    html += '<span class="word-extra" title="كلمة زائدة">' + escapeHtml(item.recited || '') + '</span> ';
-                    break;
-            }
-        });
-
-        container.innerHTML = html;
-    }
-
-    function displayAyahAnalysis(ayahAnalysis) {
-        const container = document.getElementById('ayahAnalysis');
-        let html = '';
-
-        ayahAnalysis.forEach(a => {
-            let statusIcon = '';
-            let statusColor = '';
-            let statusText = '';
-
-            if (a.status === 'correct') {
-                statusIcon = 'fa-check-circle';
-                statusColor = 'text-green-400';
-                statusText = 'صحيح';
-            } else if (a.status === 'partial') {
-                statusIcon = 'fa-exclamation-circle';
-                statusColor = 'text-yellow-400';
-                statusText = 'جزئي';
-            } else {
-                statusIcon = 'fa-times-circle';
-                statusColor = 'text-red-400';
-                statusText = 'يحتاج مراجعة';
-            }
-
-            html += '<div class="bg-quran-950/30 rounded-xl p-4 border border-gold-700/10">';
-            html += '<div class="flex items-center justify-between mb-2">';
-            html += '<div class="flex items-center gap-2">';
-            html += '<span class="ayah-number" style="width:28px;height:28px;font-size:0.7rem">' + a.ayahNumber + '</span>';
-            html += '<span class="' + statusColor + ' text-sm font-cairo"><i class="fas ' + statusIcon + ' ml-1"></i>' + statusText + '</span>';
-            html += '</div>';
-            html += '<span class="text-sm font-bold ' + statusColor + '">' + a.similarity + '%</span>';
-            html += '</div>';
-            html += '<p class="quran-text text-white text-sm">' + escapeHtml(a.originalText) + '</p>';
-            html += '<div class="mt-2 bg-gray-700/30 rounded-full h-2"><div class="h-2 rounded-full transition-all" style="width:' + a.similarity + '%;background:' + (a.similarity >= 90 ? '#22c55e' : a.similarity >= 60 ? '#eab308' : '#ef4444') + '"></div></div>';
-            html += '</div>';
-        });
-
-        container.innerHTML = html;
-    }
-
-    function displayTajweedNotes(notes) {
-        const container = document.getElementById('tajweedNotes');
-        let html = '';
-
-        notes.forEach(note => {
-            html += '<div class="flex items-start gap-3 bg-quran-950/30 rounded-lg px-4 py-3">';
-            html += '<i class="fas fa-comment-dots text-gold-500 mt-1"></i>';
-            html += '<p class="text-green-300/80 text-sm font-cairo">' + escapeHtml(note) + '</p>';
-            html += '</div>';
-        });
-
-        container.innerHTML = html;
-    }
-
-    function escapeHtml(text) {
-        if (!text) return '';
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-    }
-
-    function resetAll() {
-        finalTranscript = '';
-        interimTranscript = '';
-        document.getElementById('recognizedText').textContent = '';
-        document.getElementById('recognizedPreview').classList.add('hidden');
-        document.getElementById('manualText').value = '';
-        document.getElementById('analyzeBtn').classList.add('hidden');
-        document.getElementById('resultsSection').classList.add('hidden');
-        document.getElementById('recordStatus').textContent = 'اضغط للبدء بالتسجيل';
-        
-        // Reset score ring
-        document.getElementById('scoreRing').style.strokeDashoffset = 283;
-
-        document.getElementById('recordSection').scrollIntoView({ behavior: 'smooth' });
-    }
-    </script>
+function resetAll(){
+  finalTx='';interimTx='';
+  document.getElementById('recText').textContent='';
+  document.getElementById('recPreview').classList.add('hidden');
+  document.getElementById('manualTxt').value='';
+  document.getElementById('analyzeBtn').classList.add('hidden');
+  document.getElementById('results').classList.add('hidden');
+  document.getElementById('recStatus').textContent='اضغط لبدء التسجيل';
+  document.getElementById('scoreRing').style.strokeDashoffset=283;
+  resetLiveTracking();
+  document.getElementById('recSection').scrollIntoView({behavior:'smooth'});
+}
+</script>
 </body>
 </html>`
 }
